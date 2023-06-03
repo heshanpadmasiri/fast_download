@@ -1,3 +1,4 @@
+use futures::{stream::FuturesUnordered, StreamExt};
 use indicatif::ProgressBar;
 use reqwest;
 use std::{
@@ -6,14 +7,13 @@ use std::{
     io::{BufRead, BufReader},
     path::PathBuf,
 };
-use futures::{
-    StreamExt,
-    stream::FuturesUnordered
-};
 
 #[derive(Debug)]
 struct Args {
     url_file_name: PathBuf,
+    ignore_download_errors: bool,
+    verbose: bool,
+    force_redownload: bool,
 }
 
 #[derive(Debug)]
@@ -23,11 +23,21 @@ struct Image {
 }
 
 #[derive(Debug)]
-enum DownloadResult {
+enum DownloadCompleted {
     Success,
     Skipped,
-    Error(String),
 }
+
+#[derive(Debug)]
+enum DownloadError {
+    FailedToCreateParentDirectory,
+    FailedToCreateFile,
+    FailedToDownloadToFile,
+    FailedToConvertResponseToBytes,
+    FailedToGetUrl,
+}
+
+type DownloadResult = Result<DownloadCompleted, DownloadError>;
 
 #[tokio::main]
 async fn main() {
@@ -39,8 +49,26 @@ async fn main() {
     let pb = ProgressBar::new(n_images.try_into().unwrap());
     for image in images {
         let fut = async move {
-            if let DownloadResult::Error(err) = download_image(&image).await {
-                println!("error : {} url: {} file_name: {}", err, image.url, image.file_name);
+            match download_image(&image, args.force_redownload).await {
+                Err(err) => {
+                    println!(
+                        "error : {:?} url: {} file_name: {}",
+                        err, image.url, image.file_name
+                    );
+                    if !args.ignore_download_errors {
+                        panic!("exiting due to error");
+                    }
+                }
+                Ok(DownloadCompleted::Skipped) => {
+                    if args.verbose {
+                        println!("skipped: {}", image.file_name);
+                    }
+                }
+                Ok(DownloadCompleted::Success) => {
+                    if args.verbose {
+                        println!("downloaded: {}", image.file_name);
+                    }
+                }
             }
         };
         futures.push(fut);
@@ -58,14 +86,32 @@ async fn main() {
 
 fn parse_args() -> Option<Args> {
     let args = env::args().collect::<Vec<_>>();
-    if args.len() != 2 {
+    if args.len() < 2 {
         return None;
     }
-    let url_file_name = PathBuf::from(&args[1]);
-    if url_file_name.exists() && url_file_name.is_file() {
-        return Some(Args { url_file_name });
+    let first = &args[1];
+    match first.as_str() {
+        "-h" => {
+            println!("usage: {} <url_file_name> [-i] [-v] [-f]", args[0]);
+            return None;
+        }
+        filename => {
+            let url_file_name = PathBuf::from(filename);
+            if url_file_name.exists() && url_file_name.is_file() {
+                let ignore_download_errors = args.contains(&"-i".to_string());
+                let verbose = args.contains(&"-v".to_string());
+                let force_redownload = args.contains(&"-f".to_string());
+                return Some(Args {
+                    url_file_name,
+                    ignore_download_errors,
+                    verbose,
+                    force_redownload,
+                });
+            }
+            println!("invalid url file: {}", filename);
+            return None;
+        }
     }
-    None
 }
 
 fn parse_url_file(args: &Args) -> Vec<Image> {
@@ -92,10 +138,16 @@ fn parse_url_file(args: &Args) -> Vec<Image> {
     images
 }
 
-async fn download_image(image: &Image) -> DownloadResult {
+async fn download_image(image: &Image, force_redownload: bool) -> DownloadResult {
     let path = PathBuf::from(&image.file_name);
     if path.exists() {
-        return DownloadResult::Skipped;
+        if force_redownload {
+            if let Err(_) = std::fs::remove_file(&path) {
+                return Err(DownloadError::FailedToCreateFile);
+            }
+        } else {
+            return Ok(DownloadCompleted::Skipped);
+        }
     }
     match reqwest::get(&image.url).await {
         Ok(response) => {
@@ -103,23 +155,23 @@ async fn download_image(image: &Image) -> DownloadResult {
             match bytes {
                 Ok(bytes) => {
                     if let Some(parent) = path.parent() {
-                        if let Err(err) = std::fs::create_dir_all(parent) {
-                            return DownloadResult::Error(err.to_string());
+                        if let Err(_) = std::fs::create_dir_all(parent) {
+                            return Err(DownloadError::FailedToCreateParentDirectory);
                         }
                     }
                     match File::create(path) {
                         Ok(mut file) => {
-                            if let Err(err) = std::io::copy(&mut bytes.as_ref(), &mut file) {
-                                return DownloadResult::Error(err.to_string());
+                            if let Err(_) = std::io::copy(&mut bytes.as_ref(), &mut file) {
+                                return Err(DownloadError::FailedToDownloadToFile);
                             }
                         }
-                        Err(err) => return DownloadResult::Error(err.to_string()),
+                        Err(_) => return Err(DownloadError::FailedToCreateFile),
                     }
                 }
-                Err(err) => return DownloadResult::Error(err.to_string()),
+                Err(_) => return Err(DownloadError::FailedToConvertResponseToBytes),
             }
-            DownloadResult::Success
+            Ok(DownloadCompleted::Success)
         }
-        Err(err) => DownloadResult::Error(err.to_string()),
+        Err(_) => Err(DownloadError::FailedToGetUrl),
     }
 }
