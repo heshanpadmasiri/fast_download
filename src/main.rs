@@ -14,6 +14,7 @@ struct Args {
     ignore_download_errors: bool,
     verbose: bool,
     force_redownload: bool,
+    max_concurrent_downloads: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -47,6 +48,7 @@ async fn main() {
     let mut futures = FuturesUnordered::new();
 
     let pb = ProgressBar::new(n_images.try_into().unwrap());
+    let max_concurrent_downloads = args.max_concurrent_downloads.unwrap_or(20);
     for image in images {
         let fut = async move {
             match download_image(&image, args.force_redownload).await {
@@ -72,7 +74,7 @@ async fn main() {
             }
         };
         futures.push(fut);
-        if futures.len() > 20 {
+        if futures.len() > max_concurrent_downloads {
             futures.next().await.unwrap();
             pb.inc(1);
         }
@@ -92,7 +94,7 @@ fn parse_args() -> Option<Args> {
     let first = &args[1];
     match first.as_str() {
         "-h" => {
-            println!("usage: {} <url_file_name> [-i] [-v] [-f]", args[0]);
+            println!("usage: {} <url_file_name> [-i] [-v] [-f] [-c<number>]", args[0]);
             return None;
         }
         filename => {
@@ -101,11 +103,16 @@ fn parse_args() -> Option<Args> {
                 let ignore_download_errors = args.contains(&"-i".to_string());
                 let verbose = args.contains(&"-v".to_string());
                 let force_redownload = args.contains(&"-f".to_string());
+                let max_concurrent_downloads = args
+                    .iter()
+                    .find(|s| s.starts_with("-c"))
+                    .map(|s| s[2..].parse::<usize>().expect("failed to parse -c argument"));
                 return Some(Args {
                     url_file_name,
                     ignore_download_errors,
                     verbose,
                     force_redownload,
+                    max_concurrent_downloads,
                 });
             }
             println!("invalid url file: {}", filename);
